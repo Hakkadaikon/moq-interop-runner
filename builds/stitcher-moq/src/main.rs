@@ -10,13 +10,27 @@
 //! listed moq-lite would negotiate moq-lite and exercise nothing IETF. `MOQ_CLIENT_VERSION`
 //! (comma-separated, e.g. `moq-transport-18` or `moq-lite-05`) overrides the offer.
 //!
-//! Honest about what moq-net can put on the wire: its consumer API resolves a path only
-//! through a route someone announced, so a SUBSCRIBE for an unannounced path is answered
-//! *locally* (`unroutable`) and never reaches the relay. When that happens `subscribe-error`
-//! reports `# SKIP` (as moq-dev's own runner client does) instead of claiming a relay
-//! REQUEST_ERROR it never saw; `subscribe-before-announce` exercises the late-announce
-//! routing but, for the same reason, sends its SUBSCRIBE only after the announcement.
+//! Honest about what moq-net can put on the wire, and about what it can observe:
+//!
+//! - Its consumer API resolves a path only through a route someone announced, so a
+//!   SUBSCRIBE for an unannounced path is answered *locally* (`unroutable`) and never
+//!   reaches the relay. When that happens `subscribe-error` reports `# SKIP` (as moq-dev's
+//!   own runner client does) instead of claiming a relay REQUEST_ERROR it never saw, and
+//!   `subscribe-before-announce` sends its SUBSCRIBE only after the late announcement.
+//! - It accepts an IETF subscription locally, before SUBSCRIBE_OK (objects may outrun the
+//!   reply), so a resolved subscribe proves nothing about the relay. `announce-subscribe`
+//!   and `subscribe-before-announce` pass only once the relay has routed the SUBSCRIBE to
+//!   this client's own publisher and no REQUEST_ERROR followed; an abort that is not a
+//!   REQUEST_ERROR (say, an answer that did not decode) is reported as such.
+//! - It surfaces no PUBLISH_NAMESPACE_OK, so `announce-only` and `publish-namespace-done`
+//!   report what they can see: the announce was not rejected and the session stayed up.
+//!
+//! Subscribers discover the namespace under test (SUBSCRIBE_NAMESPACE `moq-test/interop`),
+//! not the empty prefix, which draft-14 forbids and several relays reject. Sessions close
+//! subscriber first, and the process lets its last CONNECTION_CLOSE go out before it
+//! exits: a relay that still holds a dead session routes the next run's SUBSCRIBE to it.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -182,6 +196,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Let the last sessions' QUIC CONNECTION_CLOSE go out before the process exits, so
+    // the relay isn't left holding them until its idle timeout.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     if !all_passed {
         std::process::exit(1);
     }
@@ -329,7 +347,10 @@ async fn test_announce_only(
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
-        outcome: Some("announce accepted (session healthy)".into()),
+        outcome: Some(
+            "PUBLISH_NAMESPACE not rejected: session healthy 700 ms later (moq-net does not surface PUBLISH_NAMESPACE_OK)"
+                .into(),
+        ),
         ..Default::default()
     })
 }
@@ -370,7 +391,7 @@ async fn test_publish_namespace_done(
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
-        outcome: Some("namespace withdrawn cleanly".into()),
+        outcome: Some("PUBLISH_NAMESPACE_DONE sent; session healthy 300 ms later".into()),
         ..Default::default()
     })
 }
@@ -381,7 +402,8 @@ async fn test_subscribe_error(
     client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
-    let origin = moq_tokio::origin::spawn();
+    let root = moq_tokio::origin::spawn();
+    let origin = scoped(&root, NONEXISTENT_NAMESPACE)?;
     let consumer = origin.consume();
 
     let connection = connect(client, relay_url, None, Some(origin)).await?;
@@ -400,14 +422,28 @@ async fn test_subscribe_error(
         }
         Err(e) => format!("request rejected cleanly: {}", e),
         Ok(broadcast) => {
-            // The request resolved optimistically (a route covers the path); the track
-            // subscription must then fail cleanly for this test to pass.
+            // The request resolved optimistically (a route covers the path), so a SUBSCRIBE
+            // goes to the relay. moq-net accepts an IETF subscription locally before the
+            // answer arrives; the relay's REQUEST_ERROR shows up as the track aborting.
             let track = broadcast
                 .track(TEST_TRACK)
                 .context("failed to request track")?;
             match track.subscribe(None).await {
-                Ok(_) => anyhow::bail!("subscription to nonexistent track succeeded"),
                 Err(e) => format!("track rejected cleanly: {}", e),
+                Ok(mut subscriber) => {
+                    match tokio::time::timeout(Duration::from_millis(1000), subscriber.recv_group())
+                        .await
+                    {
+                        Ok(Err(e)) if is_request_error(&e) => format!("REQUEST_ERROR: {}", e),
+                        Ok(Err(e)) => anyhow::bail!(
+                            "the subscription failed locally ({}), not with a REQUEST_ERROR",
+                            e
+                        ),
+                        _ => anyhow::bail!(
+                            "relay did not reject the SUBSCRIBE for a nonexistent track within 1000 ms"
+                        ),
+                    }
+                }
             }
         }
     };
@@ -432,12 +468,14 @@ async fn test_announce_subscribe(
     client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
+    let started = Instant::now();
+
     // Publisher.
     let pub_origin = moq_tokio::origin::spawn();
     let broadcast = pub_origin
         .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
-    let _track = broadcast
+    let pub_track = broadcast
         .create_track(TEST_TRACK, None)
         .context("failed to create track")?;
     broadcast
@@ -452,11 +490,14 @@ async fn test_announce_subscribe(
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Subscriber.
-    let sub_origin = moq_tokio::origin::spawn();
+    let sub_root = moq_tokio::origin::spawn();
+    let sub_origin = scoped(&sub_root, TEST_NAMESPACE)?;
     let sub_consumer = sub_origin.consume();
+    let dialed = Instant::now();
     let sub_connection = connect(client, relay_url, None, Some(sub_origin))
         .await
         .context("subscriber")?;
+    let rtt_hint = rtt(&sub_connection, dialed.elapsed());
     let negotiated = negotiated(&sub_connection);
 
     // Wait for the relay to route the publisher's announcement to us, then subscribe.
@@ -471,88 +512,127 @@ async fn test_announce_subscribe(
     let track = sub_broadcast
         .track(TEST_TRACK)
         .context("failed to subscribe track")?;
-
-    // SUBSCRIBE_OK: the subscription resolves with the track info once the relay
-    // routes it to the publisher; a rejection resolves with the abort error.
-    let _subscriber = track
+    let mut subscriber = track
         .subscribe(None)
         .await
         .context("track subscription rejected")?;
 
-    pub_connection.abort(Error::Cancel);
+    // Leave room in the 3 s budget for the confirm window.
+    let route_by = started + Duration::from_millis(2400);
+    let routed = match relay_answer(
+        &pub_track,
+        &mut subscriber,
+        route_by,
+        confirm_window(rtt_hint),
+    )
+    .await?
+    {
+        RelayAnswer::Accepted { routed } => routed,
+        RelayAnswer::Rejected(e) => anyhow::bail!("relay rejected the SUBSCRIBE: {}", e),
+    };
+
+    // Subscriber leaves first, then the publisher: a relay that tears a namespace down
+    // lazily while a subscription through it is live can otherwise keep advertising it
+    // into the next test.
+    drop(subscriber);
     sub_connection.abort(Error::Cancel);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pub_connection.abort(Error::Cancel);
     drop(broadcast);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
-        outcome: Some("SUBSCRIBE_OK (track info received)".into()),
+        outcome: Some(format!(
+            "relay routed the SUBSCRIBE to the publisher ({} ms), no REQUEST_ERROR followed",
+            routed.as_millis()
+        )),
         ..Default::default()
     })
 }
 
-/// Subscriber connects and SUBSCRIBEs first; publisher announces 500ms later.
-/// Per the test spec, either a late success or a clean REQUEST_ERROR passes —
-/// the test checks graceful handling of the out-of-order flow.
+/// Subscriber connects first; publisher announces 500ms later.
+/// Per the test spec, either a late success or a clean REQUEST_ERROR passes: the test
+/// checks graceful handling of the out-of-order flow. moq-net sends a SUBSCRIBE only once
+/// an announced route covers the path, so the subscriber's interest waits locally and the
+/// SUBSCRIBE goes out after the late announce reaches it.
 async fn test_subscribe_before_announce(
     client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
+    let started = Instant::now();
+
     // Subscriber connects first.
-    let sub_origin = moq_tokio::origin::spawn();
+    let sub_root = moq_tokio::origin::spawn();
+    let sub_origin = scoped(&sub_root, TEST_NAMESPACE)?;
     let sub_consumer = sub_origin.consume();
+    let dialed = Instant::now();
     let sub_connection = connect(client, relay_url, None, Some(sub_origin))
         .await
         .context("subscriber")?;
+    let rtt_hint = rtt(&sub_connection, dialed.elapsed());
     let negotiated = negotiated(&sub_connection);
 
-    // The shared test namespace can linger at the relay for a moment after the
-    // previous test's session teardown; wait for any stale announcement to clear
-    // so the "before announce" ordering below is real.
+    // "Before announce" only means something if the relay is not already advertising
+    // the namespace. It can be: a relay may keep a previous session's namespace listed
+    // for a while after that session is gone. The relay's namespace snapshot arrives a
+    // round trip or two after SETUP, so watch until then, and give a stale covering
+    // route a bounded chance to retract.
     let mut announcements = sub_consumer.announced();
-    let mut lingering = false;
-    let settle_deadline = Instant::now() + Duration::from_millis(1500);
+    let mut stale: HashSet<String> = HashSet::new();
+    let snapshot_by = Instant::now() + snapshot_window(rtt_hint);
+    let give_up = snapshot_by + Duration::from_millis(800);
     loop {
-        let quiet = if lingering {
-            settle_deadline.saturating_duration_since(Instant::now())
+        let until = if stale.is_empty() {
+            snapshot_by
         } else {
-            Duration::from_millis(300)
+            give_up
         };
-        if quiet.is_zero() {
+        let wait = until.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
             break;
         }
-        match tokio::time::timeout(quiet, announcements.next()).await {
-            Ok(Some(update)) if update.prefix.as_str() == TEST_NAMESPACE => {
-                lingering = !matches!(update.kind, moq_net::announce::Kind::Retracted);
-                if !lingering {
-                    break; // stale announcement cleared
+        match tokio::time::timeout(wait, announcements.next()).await {
+            Ok(Some(update)) if covers(update.prefix.as_str(), TEST_NAMESPACE) => {
+                let prefix = update.prefix.as_str().to_string();
+                if matches!(update.kind, moq_net::announce::Kind::Retracted) {
+                    stale.remove(&prefix);
+                } else {
+                    stale.insert(prefix);
                 }
             }
             Ok(Some(_)) => continue, // unrelated route
             Ok(None) => anyhow::bail!("origin closed while settling"),
-            Err(_) => break, // quiet: nothing (more) pending
+            Err(_) => break,
         }
     }
 
-    // Express interest before any announcement exists: start waiting for the
-    // broadcast now. The wait completes once the publisher shows up.
+    // Express interest before any announcement exists: start waiting for the broadcast
+    // now. The wait completes once the publisher's announce is routed to us.
     let pending = sub_consumer.routed_broadcast(TEST_NAMESPACE);
     tokio::pin!(pending);
 
-    // Confirm nothing resolves while the namespace is unpublished. (Skipped if a
-    // stale announcement never cleared — the late-success outcome still applies.)
-    if !lingering {
-        tokio::select! {
-            _ = &mut pending => anyhow::bail!("broadcast resolved before anyone announced it"),
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+    // Nothing may resolve while the namespace is unpublished. Anything that does is not
+    // our publisher (it doesn't exist yet): a stale route the snapshot delivered late.
+    // Note it rather than fail; the subscribe-first ordering just can't be claimed.
+    let mut ordered = stale.is_empty();
+    let mut resolved_early = false;
+    tokio::select! {
+        _ = &mut pending => {
+            ordered = false;
+            resolved_early = true;
         }
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
     }
+
+    // Updates so far predate our publisher; drop them so the wait below sees its announce.
+    while announcements.try_next().is_some() {}
 
     // Publisher starts 500ms after the subscriber, per the spec.
     let pub_origin = moq_tokio::origin::spawn();
     let broadcast = pub_origin
         .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
-    let _track = broadcast
+    let pub_track = broadcast
         .create_track(TEST_TRACK, None)
         .context("failed to create track")?;
     broadcast
@@ -563,31 +643,217 @@ async fn test_subscribe_before_announce(
         .await
         .context("publisher")?;
 
-    // The early subscribe must now succeed (relay routes the late announcement),
-    // per the spec's "eventually succeeds once publisher announces" outcome.
-    let sub_broadcast = tokio::time::timeout(Duration::from_millis(2000), &mut pending)
+    let sub_broadcast = if resolved_early {
+        // Resolved through a stale route: give our announce a moment to reach the relay
+        // (and us), then resolve afresh, so the SUBSCRIBE neither races the announce nor
+        // rides a route that may be about to retract.
+        let _ = tokio::time::timeout(Duration::from_millis(1000), async {
+            while let Some(update) = announcements.next().await {
+                if covers(update.prefix.as_str(), TEST_NAMESPACE)
+                    && !matches!(update.kind, moq_net::announce::Kind::Retracted)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            sub_consumer.routed_broadcast(TEST_NAMESPACE),
+        )
         .await
-        .context("early subscribe never resolved after the announce")?
-        .context("broadcast never became routable")?;
+        .context("no route after the announce")?
+        .context("broadcast never became routable")?
+    } else {
+        // The early interest must now resolve (the relay routes the late announcement),
+        // per the spec's "eventually succeeds once publisher announces" outcome.
+        tokio::time::timeout(Duration::from_millis(2000), &mut pending)
+            .await
+            .context("early subscribe never resolved after the announce")?
+            .context("broadcast never became routable")?
+    };
 
     let track = sub_broadcast
         .track(TEST_TRACK)
         .context("failed to subscribe track")?;
-    let _subscriber = track
+    let mut subscriber = track
         .subscribe(None)
         .await
         .context("track subscription rejected")?;
 
-    pub_connection.abort(Error::Cancel);
+    // Leave room in the 5 s budget for the confirm window.
+    let route_by = started + Duration::from_millis(4300);
+    let answer = relay_answer(
+        &pub_track,
+        &mut subscriber,
+        route_by,
+        confirm_window(rtt_hint),
+    )
+    .await?;
+
+    // The spec also accepts a clean REQUEST_ERROR, provided it is request-scoped.
+    if let RelayAnswer::Rejected(_) = &answer {
+        tokio::select! {
+            res = sub_connection.closed() => anyhow::bail!("session died instead of returning a request error: {:?}", res),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    drop(subscriber);
     sub_connection.abort(Error::Cancel);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pub_connection.abort(Error::Cancel);
     drop(broadcast);
+
+    let routed = match answer {
+        RelayAnswer::Accepted { routed } => routed,
+        RelayAnswer::Rejected(e) => {
+            return Ok(Diagnostics {
+                negotiated: Some(negotiated),
+                outcome: Some(format!(
+                    "relay answered the SUBSCRIBE with REQUEST_ERROR ({}) and the session survived; the spec accepts a clean REQUEST_ERROR here",
+                    e
+                )),
+                ..Default::default()
+            });
+        }
+    };
+
+    let outcome = if ordered {
+        format!(
+            "subscriber connected first; nothing resolved until the late announce, which the relay routed to it; the SUBSCRIBE then reached the publisher ({} ms), no REQUEST_ERROR followed (moq-net sends SUBSCRIBE only after an announce)",
+            routed.as_millis()
+        )
+    } else {
+        format!(
+            "relay still advertised {} from an earlier session when the subscriber connected, so subscribe-first ordering is unverified; after the late announce the SUBSCRIBE reached the publisher ({} ms), no REQUEST_ERROR followed",
+            TEST_NAMESPACE,
+            routed.as_millis()
+        )
+    };
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
-        outcome: Some(
-            "subscriber connected first; late announce routed to it, then SUBSCRIBE_OK (no SUBSCRIBE is sent before the announce)"
-                .into(),
-        ),
+        outcome: Some(outcome),
         ..Default::default()
     })
+}
+
+/// Whether an announced route for `prefix` covers `path`: moq-net routes cover every
+/// path beneath them, and the empty prefix covers everything.
+fn covers(prefix: &str, path: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+/// The connection's smoothed round-trip time, or `fallback` (the connect time) when the
+/// transport doesn't report one. The connect time alone overstates it whenever the
+/// handshake needed retransmissions.
+fn rtt(connection: &moq_tokio::Connection, fallback: Duration) -> Duration {
+    connection
+        .monitor()
+        .stats()
+        .and_then(|stats| stats.rtt)
+        .unwrap_or(fallback)
+}
+
+/// How long after SETUP a relay's namespace snapshot can take to arrive: its SETUP,
+/// then SUBSCRIBE_NAMESPACE and the answer, each about a round trip.
+fn snapshot_window(rtt_hint: Duration) -> Duration {
+    (rtt_hint * 4).clamp(Duration::from_millis(600), Duration::from_millis(1500))
+}
+
+/// How long to watch for a REQUEST_ERROR after the relay routed a SUBSCRIBE: the
+/// publisher's SUBSCRIBE_OK, and the relay's answer to us, are a round trip.
+fn confirm_window(rtt_hint: Duration) -> Duration {
+    (rtt_hint * 2).clamp(Duration::from_millis(200), Duration::from_millis(500))
+}
+
+/// What the relay did with a subscription moq-net had already accepted locally.
+enum RelayAnswer {
+    /// Routed to our publisher, and no REQUEST_ERROR followed within the confirm window.
+    Accepted { routed: Duration },
+    /// Answered with REQUEST_ERROR (the error its code maps to).
+    Rejected(Error),
+}
+
+/// Whether a subscription's abort error is what moq-net makes of a REQUEST_ERROR code,
+/// as opposed to a local failure (an answer that did not decode, a dead session, ...).
+fn is_request_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Unauthorized
+            | Error::Timeout
+            | Error::Unsupported
+            | Error::NotFound
+            | Error::Unroutable
+            | Error::MalformedTrack
+            | Error::GoingAway
+            | Error::Remote(_)
+    )
+}
+
+/// A subscription abort as a relay answer, or the local failure it really is.
+fn rejection(err: Error) -> anyhow::Result<RelayAnswer> {
+    if is_request_error(&err) {
+        Ok(RelayAnswer::Rejected(err))
+    } else {
+        anyhow::bail!(
+            "the subscription failed locally ({}), not with a REQUEST_ERROR: e.g. the relay's answer did not decode",
+            err
+        )
+    }
+}
+
+/// Evidence of what the relay did with a subscription.
+///
+/// moq-net resolves an IETF subscription locally, before SUBSCRIBE_OK (objects can
+/// outrun the reply, so it accepts at once and a later REQUEST_ERROR aborts the track),
+/// so the resolve alone proves nothing about the relay. What does: the relay routing
+/// the SUBSCRIBE to our own publisher (its track gains a consumer) by `route_by`, then no
+/// REQUEST_ERROR within `confirm`.
+async fn relay_answer(
+    publisher_track: &moq_net::track::Producer,
+    subscriber: &mut moq_net::track::Subscriber,
+    route_by: Instant,
+    confirm: Duration,
+) -> anyhow::Result<RelayAnswer> {
+    let start = Instant::now();
+    let route_within = route_by.saturating_duration_since(start);
+    tokio::select! {
+        res = publisher_track.used() => {
+            res.context("publisher track closed before the SUBSCRIBE reached it")?
+        }
+        res = subscriber.recv_group() => return match res {
+            Err(e) => rejection(e),
+            Ok(_) => anyhow::bail!("subscription ended before the relay routed it to the publisher"),
+        },
+        _ = tokio::time::sleep(route_within) => anyhow::bail!(
+            "the relay did not route the SUBSCRIBE to the publisher within {} ms (and sent no REQUEST_ERROR)",
+            route_within.as_millis()
+        ),
+    }
+    let routed = start.elapsed();
+
+    match tokio::time::timeout(confirm, subscriber.recv_group()).await {
+        Ok(Err(e)) => rejection(e),
+        // Still open (or already carrying data, or cleanly finished): accepted.
+        Err(_) | Ok(Ok(_)) => Ok(RelayAnswer::Accepted { routed }),
+    }
+}
+
+/// A subscriber origin scoped to `namespace`, so moq-net's namespace discovery asks the
+/// relay for that prefix (SUBSCRIBE_NAMESPACE `namespace`) rather than the empty prefix,
+/// which draft-14 forbids and which several relays reject or answer without the
+/// namespaces already published. Keep `root` alive for as long as the scoped origin.
+fn scoped(
+    root: &moq_net::origin::Producer,
+    namespace: &str,
+) -> anyhow::Result<moq_net::origin::Producer> {
+    let patterns = moq_net::Patterns::from(
+        moq_net::Pattern::subtree(namespace).context("invalid namespace pattern")?,
+    );
+    root.scope("", &patterns)
+        .context("failed to scope the subscriber origin")
 }
