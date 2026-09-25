@@ -1,22 +1,33 @@
 //! stitcher-moq interop test client (Paramount).
 //!
-//! Built on the current crates.io moq-net/moq-native (0.19.x) — the same stack the
-//! stitcher-moq production publisher runs — this client implements ALL six canonical
-//! test cases, including the two the reference moq-dev-rs client skips: the current
-//! `Consumer::request_broadcast` API registers a dynamic broadcast request that the
-//! session's subscriber side puts on the wire, so a SUBSCRIBE can be sent without
-//! first receiving an announcement (`subscribe-error`, `subscribe-before-announce`).
+//! Built on moq-dev's 0.15 release line from crates.io (`moq-tokio` 0.19 / `moq-net` 0.3) —
+//! the stack Paramount's stitcher-moq publisher and relay run since 2026-09-24 — so it can
+//! offer MoQT draft-22, the Seattle interop target, and implements all six canonical test
+//! cases.
+//!
+//! By default it offers only the MoQT (IETF) drafts the crates implement, `moqt-22` down to
+//! `moqt-14`: this is an MoQT interop client, and against a moq-dev relay an offer that also
+//! listed moq-lite would negotiate moq-lite and exercise nothing IETF. `MOQ_CLIENT_VERSION`
+//! (comma-separated, e.g. `moq-transport-18` or `moq-lite-05`) overrides the offer.
+//!
+//! Honest about what moq-net can put on the wire: its consumer API resolves a path only
+//! through a route someone announced, so a SUBSCRIBE for an unannounced path is answered
+//! *locally* (`unroutable`) and never reaches the relay. When that happens `subscribe-error`
+//! reports `# SKIP` (as moq-dev's own runner client does) instead of claiming a relay
+//! REQUEST_ERROR it never saw; `subscribe-before-announce` exercises the late-announce
+//! routing but, for the same reason, sends its SUBSCRIBE only after the announcement.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
-use moq_native::moq_net;
-use moq_net::*;
+use moq_net::origin::Route;
+use moq_net::Error;
+use moq_tokio::moq_net;
 
 #[derive(Parser)]
 #[command(name = "stitcher-moq-client")]
-#[command(about = "MoQT interop test client (Paramount stitcher-moq, moq-net/moq-native)")]
+#[command(about = "MoQT interop test client (Paramount stitcher-moq, moq-net/moq-tokio)")]
 struct Cli {
     /// Relay URL (https:// for WebTransport, moqt:// for raw QUIC)
     #[arg(
@@ -61,12 +72,24 @@ const TEST_NAMESPACE: &str = "moq-test/interop";
 const TEST_TRACK: &str = "test-track";
 const NONEXISTENT_NAMESPACE: &str = "nonexistent/namespace";
 
+/// The default offer: every MoQT draft moq-net 0.3 implements, newest first.
+const IETF_VERSIONS: &[&str] = &[
+    "moq-transport-22",
+    "moq-transport-21",
+    "moq-transport-20",
+    "moq-transport-19",
+    "moq-transport-18",
+    "moq-transport-17",
+    "moq-transport-16",
+    "moq-transport-15",
+    "moq-transport-14",
+];
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Install the crypto provider before any TLS machinery runs (mirrors moq-cli).
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("failed to install default crypto provider");
+    // Install the crypto provider before any TLS machinery runs (mirrors moq-cli). Ignore
+    // the error if a provider is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
 
@@ -79,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.verbose {
         tracing_subscriber::fmt()
-            .with_env_filter("moq=debug,moq_native=debug")
+            .with_env_filter("moq_net=debug,moq_tokio=debug")
             .init();
     }
 
@@ -94,35 +117,45 @@ async fn main() -> anyhow::Result<()> {
         None => TESTS.to_vec(),
     };
 
-    println!("TAP version 14");
-    println!("# stitcher-moq-client v0.1.0 (moq-net via moq-native 0.19)");
-    println!("# Relay: {}", cli.relay);
-    println!("1..{}", tests.len());
-
     let relay_url = url::Url::parse(&cli.relay).context("invalid relay URL")?;
 
-    let mut client_config = moq_native::ClientConfig::default();
-    if cli.tls_disable_verify {
-        client_config.tls.disable_verify = Some(true);
-    }
-
-    // Optionally pin the offered protocol version(s) via MOQ_CLIENT_VERSION
-    // (comma-separated, e.g. "moq-transport-18"). By default the client offers
-    // every supported version and lets the relay choose.
-    if let Ok(versions) = std::env::var("MOQ_CLIENT_VERSION") {
-        let versions = versions
+    // The offered protocol versions: MOQ_CLIENT_VERSION (comma-separated, e.g.
+    // "moq-transport-18") when set, otherwise every MoQT draft (see IETF_VERSIONS).
+    let offered: Vec<String> = match std::env::var("MOQ_CLIENT_VERSION") {
+        Ok(v) if !v.trim().is_empty() => v
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<moq_net::Version>().map_err(|e| anyhow::anyhow!("{}", e)))
-            .collect::<anyhow::Result<Vec<_>>>()
-            .context("invalid MOQ_CLIENT_VERSION")?;
-        if !versions.is_empty() {
-            client_config.version = versions;
-        }
-    }
+            .map(String::from)
+            .collect(),
+        _ => IETF_VERSIONS.iter().map(|s| s.to_string()).collect(),
+    };
+    let versions = offered
+        .iter()
+        .map(|s| {
+            s.parse::<moq_net::Version>()
+                .map_err(|e| anyhow::anyhow!("{}: {}", s, e))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .context("invalid MOQ_CLIENT_VERSION")?;
 
-    let client = client_config.init().context("failed to init client")?;
+    println!("TAP version 14");
+    println!("# stitcher-moq-client v0.2.0 (moq-net 0.3 via moq-tokio 0.19, moq-dev 0.15 line)");
+    println!("# Relay: {}", cli.relay);
+    println!("# Offered: {}", offered.join(", "));
+    println!("1..{}", tests.len());
+
+    // `connect::Config` is `#[non_exhaustive]`: take the defaults and set what we own.
+    let mut config = moq_tokio::connect::Config::default();
+    config.version = versions;
+    if cli.tls_disable_verify {
+        config.tls.insecure = Some(true);
+    }
+    // One dial per test: a failed connect must fail the test, not be retried.
+    config.once = Some(true);
+    let client = config
+        .init(moq_tokio::quic::Config::default())
+        .context("failed to init client")?;
 
     let mut all_passed = true;
 
@@ -135,7 +168,10 @@ async fn main() -> anyhow::Result<()> {
 
         match result {
             Ok(diag) => {
-                println!("ok {} - {}", num, test_name);
+                match &diag.skip {
+                    Some(reason) => println!("ok {} - {} # SKIP {}", num, test_name, reason),
+                    None => println!("ok {} - {}", num, test_name),
+                }
                 print_diagnostics(duration_ms, &diag);
             }
             Err(e) => {
@@ -157,6 +193,8 @@ async fn main() -> anyhow::Result<()> {
 struct Diagnostics {
     negotiated: Option<String>,
     outcome: Option<String>,
+    /// Report the test as `ok … # SKIP <reason>`: nothing was exercised on the wire.
+    skip: Option<String>,
 }
 
 fn print_diagnostics(duration_ms: u128, diag: &Diagnostics) {
@@ -180,7 +218,7 @@ fn print_failure_diagnostics(duration_ms: u128, message: &str) {
 
 async fn run_test(
     name: &str,
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
     let timeout = match name {
@@ -202,7 +240,7 @@ async fn run_test(
 
 async fn run_test_inner(
     name: &str,
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
     match name {
@@ -216,19 +254,43 @@ async fn run_test_inner(
     }
 }
 
+/// Dial the relay once — as a publisher of `publish`, a subscriber into `subscribe`, or
+/// neither — and wait until the MoQ session is established.
+async fn connect(
+    client: &moq_tokio::Client,
+    relay_url: &url::Url,
+    publish: Option<moq_net::origin::Consumer>,
+    subscribe: Option<moq_net::origin::Producer>,
+) -> anyhow::Result<moq_tokio::Connection> {
+    let mut client = client.clone();
+    if let Some(origin) = publish {
+        client = client.with_publisher(origin);
+    }
+    if let Some(origin) = subscribe {
+        client = client.with_subscriber(origin);
+    }
+    client
+        .connect(relay_url.clone())
+        .established()
+        .await
+        .context("failed to connect")
+}
+
+fn negotiated(connection: &moq_tokio::Connection) -> String {
+    connection
+        .version()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Connect, complete SETUP, close gracefully.
 async fn test_setup_only(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
-    let session = client
-        .clone()
-        .connect(relay_url.clone())
-        .await
-        .context("failed to connect")?;
-
-    let negotiated = format!("{}", session.version());
-    session.abort(Error::Cancel);
+    let connection = connect(client, relay_url, None, None).await?;
+    let negotiated = negotiated(&connection);
+    connection.abort(Error::Cancel);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
@@ -242,101 +304,103 @@ async fn test_setup_only(
 /// unauthorized announce errors the session, so "announce sent + session still alive
 /// after a grace period" is the observable success criterion.
 async fn test_announce_only(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
-    let origin = Origin::random().produce();
-    let _broadcast = origin
-        .create_broadcast(TEST_NAMESPACE, broadcast::Route::new().with_announce(true))
+    let origin = moq_tokio::origin::spawn();
+    let broadcast = origin
+        .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
+    // On the 0.15 line a broadcast is invisible until announced.
+    broadcast
+        .announce(Route::default())
+        .context("failed to announce")?;
 
-    let session = client
-        .clone()
-        .with_publisher(&origin)
-        .connect(relay_url.clone())
-        .await
-        .context("failed to connect")?;
-
-    let negotiated = format!("{}", session.version());
+    let connection = connect(client, relay_url, Some(origin.consume()), None).await?;
+    let negotiated = negotiated(&connection);
 
     tokio::select! {
-        err = session.closed() => anyhow::bail!("session closed after announce: {}", err),
+        res = connection.closed() => anyhow::bail!("session closed after announce: {:?}", res),
         _ = tokio::time::sleep(Duration::from_millis(700)) => {}
     }
 
-    session.abort(Error::Cancel);
+    connection.abort(Error::Cancel);
+    drop(broadcast);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
         outcome: Some("announce accepted (session healthy)".into()),
+        ..Default::default()
     })
 }
 
-/// Connect, announce, then withdraw the namespace by finishing the broadcast.
+/// Connect, announce, then withdraw the namespace (PUBLISH_NAMESPACE_DONE on the wire).
 async fn test_publish_namespace_done(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
-    let origin = Origin::random().produce();
-    let mut broadcast = origin
-        .create_broadcast(TEST_NAMESPACE, broadcast::Route::new().with_announce(true))
+    let origin = moq_tokio::origin::spawn();
+    let broadcast = origin
+        .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
+    broadcast
+        .announce(Route::default())
+        .context("failed to announce")?;
 
-    let session = client
-        .clone()
-        .with_publisher(&origin)
-        .connect(relay_url.clone())
-        .await
-        .context("failed to connect")?;
-
-    let negotiated = format!("{}", session.version());
+    let connection = connect(client, relay_url, Some(origin.consume()), None).await?;
+    let negotiated = negotiated(&connection);
 
     // Let the announce land.
     tokio::select! {
-        err = session.closed() => anyhow::bail!("session closed after announce: {}", err),
+        res = connection.closed() => anyhow::bail!("session closed after announce: {:?}", res),
         _ = tokio::time::sleep(Duration::from_millis(500)) => {}
     }
 
-    // Withdraw: finish and drop the broadcast (unpublish/namespace-done on the wire).
+    // Withdraw: retract the announcement, then end the broadcast.
+    broadcast.unannounce();
     broadcast.finish();
     drop(broadcast);
 
     tokio::select! {
-        err = session.closed() => anyhow::bail!("session closed after unpublish: {}", err),
+        res = connection.closed() => anyhow::bail!("session closed after unpublish: {:?}", res),
         _ = tokio::time::sleep(Duration::from_millis(300)) => {}
     }
 
-    session.abort(Error::Cancel);
+    connection.abort(Error::Cancel);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
         outcome: Some("namespace withdrawn cleanly".into()),
+        ..Default::default()
     })
 }
 
 /// SUBSCRIBE to a nonexistent namespace/track and expect a clean per-request error
 /// (REQUEST_ERROR / not-found), with the session surviving.
 async fn test_subscribe_error(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
-    let origin = Origin::random().produce();
+    let origin = moq_tokio::origin::spawn();
     let consumer = origin.consume();
 
-    let session = client
-        .clone()
-        .with_subscriber(origin)
-        .connect(relay_url.clone())
-        .await
-        .context("failed to connect")?;
+    let connection = connect(client, relay_url, None, Some(origin)).await?;
+    let negotiated = negotiated(&connection);
 
-    let negotiated = format!("{}", session.version());
-
-    // Speculative request: goes on the wire, nobody has announced this path.
+    let mut skip = None;
     let outcome = match consumer.request_broadcast(NONEXISTENT_NAMESPACE).await {
+        // No announced route covers the path, so moq-net answered without sending a
+        // SUBSCRIBE: the relay's REQUEST_ERROR path was not exercised.
+        Err(Error::Unroutable) => {
+            skip = Some(
+                "moq-net answers a request for an unannounced path locally (unroutable); no SUBSCRIBE reached the relay"
+                    .to_string(),
+            );
+            "request answered locally: unroutable".to_string()
+        }
         Err(e) => format!("request rejected cleanly: {}", e),
         Ok(broadcast) => {
-            // The relay resolved a broadcast for a nonexistent path; the track
+            // The request resolved optimistically (a route covers the path); the track
             // subscription must then fail cleanly for this test to pass.
             let track = broadcast
                 .track(TEST_TRACK)
@@ -350,63 +414,59 @@ async fn test_subscribe_error(
 
     // The error must be request-scoped: the session has to survive it.
     tokio::select! {
-        err = session.closed() => anyhow::bail!("session died instead of returning a request error: {}", err),
+        res = connection.closed() => anyhow::bail!("session died instead of returning a request error: {:?}", res),
         _ = tokio::time::sleep(Duration::from_millis(300)) => {}
     }
 
-    session.abort(Error::Cancel);
+    connection.abort(Error::Cancel);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
         outcome: Some(outcome),
+        skip,
     })
 }
 
 /// Two connections: publisher announces + serves a track, subscriber subscribes.
 async fn test_announce_subscribe(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
     // Publisher.
-    let pub_origin = Origin::random().produce();
-    let mut broadcast = pub_origin
-        .create_broadcast(TEST_NAMESPACE, broadcast::Route::new().with_announce(true))
+    let pub_origin = moq_tokio::origin::spawn();
+    let broadcast = pub_origin
+        .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
     let _track = broadcast
         .create_track(TEST_TRACK, None)
         .context("failed to create track")?;
+    broadcast
+        .announce(Route::default())
+        .context("failed to announce")?;
 
-    let pub_session = client
-        .clone()
-        .with_publisher(&pub_origin)
-        .connect(relay_url.clone())
+    let pub_connection = connect(client, relay_url, Some(pub_origin.consume()), None)
         .await
-        .context("publisher failed to connect")?;
+        .context("publisher")?;
 
     // Give the relay time to process the announce.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Subscriber.
-    let sub_origin = Origin::random().produce();
+    let sub_origin = moq_tokio::origin::spawn();
     let sub_consumer = sub_origin.consume();
-
-    let sub_session = client
-        .clone()
-        .with_subscriber(sub_origin)
-        .connect(relay_url.clone())
+    let sub_connection = connect(client, relay_url, None, Some(sub_origin))
         .await
-        .context("subscriber failed to connect")?;
-
-    let negotiated = format!("{}", sub_session.version());
+        .context("subscriber")?;
+    let negotiated = negotiated(&sub_connection);
 
     // Wait for the relay to route the publisher's announcement to us, then subscribe.
     let sub_broadcast = tokio::time::timeout(
         Duration::from_millis(1500),
-        sub_consumer.announced_broadcast(TEST_NAMESPACE),
+        sub_consumer.routed_broadcast(TEST_NAMESPACE),
     )
     .await
     .context("timeout waiting for announcement")?
-    .context("origin closed before the broadcast was announced")?;
+    .context("broadcast never became routable")?;
 
     let track = sub_broadcast
         .track(TEST_TRACK)
@@ -419,12 +479,14 @@ async fn test_announce_subscribe(
         .await
         .context("track subscription rejected")?;
 
-    pub_session.abort(Error::Cancel);
-    sub_session.abort(Error::Cancel);
+    pub_connection.abort(Error::Cancel);
+    sub_connection.abort(Error::Cancel);
+    drop(broadcast);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
         outcome: Some("SUBSCRIBE_OK (track info received)".into()),
+        ..Default::default()
     })
 }
 
@@ -432,21 +494,16 @@ async fn test_announce_subscribe(
 /// Per the test spec, either a late success or a clean REQUEST_ERROR passes —
 /// the test checks graceful handling of the out-of-order flow.
 async fn test_subscribe_before_announce(
-    client: &moq_native::Client,
+    client: &moq_tokio::Client,
     relay_url: &url::Url,
 ) -> anyhow::Result<Diagnostics> {
     // Subscriber connects first.
-    let sub_origin = Origin::random().produce();
+    let sub_origin = moq_tokio::origin::spawn();
     let sub_consumer = sub_origin.consume();
-
-    let sub_session = client
-        .clone()
-        .with_subscriber(sub_origin)
-        .connect(relay_url.clone())
+    let sub_connection = connect(client, relay_url, None, Some(sub_origin))
         .await
-        .context("subscriber failed to connect")?;
-
-    let negotiated = format!("{}", sub_session.version());
+        .context("subscriber")?;
+    let negotiated = negotiated(&sub_connection);
 
     // The shared test namespace can linger at the relay for a moment after the
     // previous test's session teardown; wait for any stale announcement to clear
@@ -464,21 +521,21 @@ async fn test_subscribe_before_announce(
             break;
         }
         match tokio::time::timeout(quiet, announcements.next()).await {
-            Ok(Some(a)) if a.path.as_str() == TEST_NAMESPACE => {
-                lingering = a.broadcast.is_some();
+            Ok(Some(update)) if update.prefix.as_str() == TEST_NAMESPACE => {
+                lingering = !matches!(update.kind, moq_net::announce::Kind::Retracted);
                 if !lingering {
                     break; // stale announcement cleared
                 }
             }
-            Ok(Some(_)) => continue, // unrelated broadcast
+            Ok(Some(_)) => continue, // unrelated route
             Ok(None) => anyhow::bail!("origin closed while settling"),
             Err(_) => break, // quiet: nothing (more) pending
         }
     }
 
     // Express interest before any announcement exists: start waiting for the
-    // broadcast now. The subscription completes once the publisher shows up.
-    let pending = sub_consumer.announced_broadcast(TEST_NAMESPACE);
+    // broadcast now. The wait completes once the publisher shows up.
+    let pending = sub_consumer.routed_broadcast(TEST_NAMESPACE);
     tokio::pin!(pending);
 
     // Confirm nothing resolves while the namespace is unpublished. (Skipped if a
@@ -491,27 +548,27 @@ async fn test_subscribe_before_announce(
     }
 
     // Publisher starts 500ms after the subscriber, per the spec.
-    let pub_origin = Origin::random().produce();
-    let mut broadcast = pub_origin
-        .create_broadcast(TEST_NAMESPACE, broadcast::Route::new().with_announce(true))
+    let pub_origin = moq_tokio::origin::spawn();
+    let broadcast = pub_origin
+        .create_broadcast(TEST_NAMESPACE)
         .context("failed to create broadcast")?;
     let _track = broadcast
         .create_track(TEST_TRACK, None)
         .context("failed to create track")?;
+    broadcast
+        .announce(Route::default())
+        .context("failed to announce")?;
 
-    let pub_session = client
-        .clone()
-        .with_publisher(&pub_origin)
-        .connect(relay_url.clone())
+    let pub_connection = connect(client, relay_url, Some(pub_origin.consume()), None)
         .await
-        .context("publisher failed to connect")?;
+        .context("publisher")?;
 
     // The early subscribe must now succeed (relay routes the late announcement),
     // per the spec's "eventually succeeds once publisher announces" outcome.
     let sub_broadcast = tokio::time::timeout(Duration::from_millis(2000), &mut pending)
         .await
         .context("early subscribe never resolved after the announce")?
-        .context("origin closed before the broadcast was announced")?;
+        .context("broadcast never became routable")?;
 
     let track = sub_broadcast
         .track(TEST_TRACK)
@@ -521,11 +578,16 @@ async fn test_subscribe_before_announce(
         .await
         .context("track subscription rejected")?;
 
-    pub_session.abort(Error::Cancel);
-    sub_session.abort(Error::Cancel);
+    pub_connection.abort(Error::Cancel);
+    sub_connection.abort(Error::Cancel);
+    drop(broadcast);
 
     Ok(Diagnostics {
         negotiated: Some(negotiated),
-        outcome: Some("early subscribe resolved after announce; SUBSCRIBE_OK".into()),
+        outcome: Some(
+            "subscriber connected first; late announce routed to it, then SUBSCRIBE_OK (no SUBSCRIBE is sent before the announce)"
+                .into(),
+        ),
+        ..Default::default()
     })
 }

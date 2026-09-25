@@ -1,10 +1,12 @@
 [package]
 name = "stitcher-moq-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-moq-native = "0.19"
+# moq-dev's 0.15 release line (moq-relay 0.15.x): the stack Paramount's stitcher-moq publisher
+# and relay run since 2026-09-24. moq-tokio re-exports moq-net (0.3.x).
+moq-tokio = "0.19.14"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }

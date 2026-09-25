@@ -1,6 +1,6 @@
 {
   "name": "stitcher-moq",
-  "description": "Paramount stitcher-moq test client using moq-net/moq-native (current crates.io release)",
+  "description": "Paramount stitcher-moq test client on moq-net 0.3 / moq-tokio 0.19 (moq-dev 0.15 release line); offers MoQT drafts 14-22",
   "repository": "https://github.com/moq-dev/moq",
   "targets": {
     "client": {
