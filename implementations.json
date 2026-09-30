@@ -426,7 +426,6 @@
       "organization": "OpenMOQ",
       "repository": "https://github.com/openmoq/moqx",
       "draft_versions": [
-        "draft-14",
         "draft-16",
         "draft-18"
       ],
