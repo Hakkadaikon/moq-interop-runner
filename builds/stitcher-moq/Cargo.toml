@@ -4,9 +4,10 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# moq-dev's 0.15 release line (moq-relay 0.15.x): the stack Paramount's stitcher-moq publisher
-# and relay run since 2026-09-24. moq-tokio re-exports moq-net (0.3.x).
-moq-tokio = "0.19.14"
+# moq-tokio 0.19.20 / moq-net 0.3.8 is the moq-relay 0.16.0 release train (2026-09-30). It carries
+# moq-dev #4195, which stops refusing an EXPIRES parameter in SUBSCRIBE_OK (libquicr and aiomoqt
+# send one). moq-tokio re-exports moq-net. Paramount's relay runs moq-relay 0.15.8.
+moq-tokio = "0.19.20"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }

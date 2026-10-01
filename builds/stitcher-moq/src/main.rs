@@ -1,7 +1,8 @@
 //! stitcher-moq interop test client (Paramount).
 //!
-//! Built on moq-dev's 0.15 release line from crates.io (`moq-tokio` 0.19 / `moq-net` 0.3) —
-//! the stack Paramount's stitcher-moq publisher and relay run since 2026-09-24 — so it can
+//! Built on moq-dev's `moq-tokio` 0.19 / `moq-net` 0.3 crates from crates.io (pinned to the
+//! moq-relay 0.16.0 release train) — the stack Paramount's stitcher-moq publisher and relay
+//! run since 2026-09-24 — so it can
 //! offer MoQT draft-22, the Seattle interop target, and implements all six canonical test
 //! cases.
 //!
@@ -154,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         .context("invalid MOQ_CLIENT_VERSION")?;
 
     println!("TAP version 14");
-    println!("# stitcher-moq-client v0.2.0 (moq-net 0.3 via moq-tokio 0.19, moq-dev 0.15 line)");
+    println!("# stitcher-moq-client v0.2.0 (moq-net 0.3.8 via moq-tokio 0.19.20)");
     println!("# Relay: {}", cli.relay);
     println!("# Offered: {}", offered.join(", "));
     println!("1..{}", tests.len());
@@ -379,7 +380,7 @@ async fn test_publish_namespace_done(
 
     // Withdraw: retract the announcement, then end the broadcast.
     broadcast.unannounce();
-    broadcast.finish();
+    broadcast.close();
     drop(broadcast);
 
     tokio::select! {
