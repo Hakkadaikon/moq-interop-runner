@@ -79,6 +79,7 @@ const TESTS: &[&str] = &[
     "announce-only",
     "publish-namespace-done",
     "subscribe-error",
+    "rendezvous-timeout",
     "announce-subscribe",
     "subscribe-before-announce",
 ];
@@ -245,6 +246,7 @@ async fn run_test(
         "announce-only" => Duration::from_secs(2),
         "publish-namespace-done" => Duration::from_secs(2),
         "subscribe-error" => Duration::from_secs(2),
+        "rendezvous-timeout" => Duration::from_secs(2),
         "announce-subscribe" => Duration::from_secs(3),
         // Spec guidance is 3.5s for the flow itself; the extra headroom covers the
         // stale-announcement settle phase when the full suite runs in one process.
@@ -267,9 +269,20 @@ async fn run_test_inner(
         "announce-only" => test_announce_only(client, relay_url).await,
         "publish-namespace-done" => test_publish_namespace_done(client, relay_url).await,
         "subscribe-error" => test_subscribe_error(client, relay_url).await,
+        "rendezvous-timeout" => Ok(test_rendezvous_timeout()),
         "announce-subscribe" => test_announce_subscribe(client, relay_url).await,
         "subscribe-before-announce" => test_subscribe_before_announce(client, relay_url).await,
         _ => anyhow::bail!("unknown test: {}", name),
+    }
+}
+
+/// rendezvous-timeout wants a SUBSCRIBE carrying RENDEZVOUS_TIMEOUT. moq-net 0.3 decodes that
+/// parameter but its subscribe API cannot send one, so the test is reported as not implemented
+/// rather than run without the parameter (which would just repeat subscribe-error).
+fn test_rendezvous_timeout() -> Diagnostics {
+    Diagnostics {
+        skip: Some("not implemented: moq-net 0.3 cannot put RENDEZVOUS_TIMEOUT on a SUBSCRIBE".into()),
+        ..Default::default()
     }
 }
 
