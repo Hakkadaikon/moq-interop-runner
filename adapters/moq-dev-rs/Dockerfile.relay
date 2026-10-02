@@ -14,11 +14,14 @@
 
 FROM docker.io/moqdev/moq-relay
 
-# Map our /certs convention to moq-relay's expected env vars
-ENV MOQ_SERVER_BIND=[::]:4443
-ENV MOQ_SERVER_TLS_CERT=/certs/cert.pem
-ENV MOQ_SERVER_TLS_KEY=/certs/priv.key
-ENV MOQ_AUTH_PUBLIC=
+# Map our /certs convention to moq-relay's expected env vars. moq-relay 0.15 renamed
+# server.* to listen.* and refuses to start while an old name is set ("these settings
+# were renamed and are no longer applied"). MOQ_AUTH_PUBLIC takes moq-pattern globs on
+# 0.15: `**` is everything (the old empty "root" value now matches nothing).
+ENV MOQ_LISTEN=[::]:4443
+ENV MOQ_LISTEN_TLS_CERT=/certs/cert.pem
+ENV MOQ_LISTEN_TLS_KEY=/certs/priv.key
+ENV MOQ_AUTH_PUBLIC=**
 
 EXPOSE 4443/udp
 
