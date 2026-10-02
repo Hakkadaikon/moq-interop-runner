@@ -113,7 +113,7 @@
       "organization": "Cisco",
       "repository": "https://github.com/Quicr/libquicr",
       "draft_versions": [
-        "draft-14"
+        "draft-18"
       ],
       "notes": "C++ implementation",
       "roles": {
