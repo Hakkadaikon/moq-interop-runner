@@ -583,6 +583,23 @@
         }
       }
     },
+    "wired": {
+      "name": "wired",
+      "organization": "Hakkadaikon",
+      "repository": "https://github.com/Hakkadaikon/wired",
+      "draft_versions": [
+        "draft-19"
+      ],
+      "notes": "libc-free C QUIC/WebTransport/MoQT stack. WebTransport only.",
+      "roles": {
+        "relay": {
+          "docker": {
+            "image": "ghcr.io/hakkadaikon/wired-moqt-interop:latest",
+            "url": "https://relay:4443"
+          }
+        }
+      }
+    },
     "xquic": {
       "name": "xquic",
       "organization": "Alibaba",
