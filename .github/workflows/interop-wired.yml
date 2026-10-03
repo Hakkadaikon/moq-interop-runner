@@ -1,0 +1,38 @@
+name: Wired Interop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull images
+        run: |
+          docker pull ghcr.io/hakkadaikon/wired-moqt-interop:latest
+          jq -r '.implementations[].roles.client.docker.image // empty' implementations.json \
+            | grep '^ghcr.io/' | sort -u \
+            | while read -r image; do docker pull "$image" || echo "WARNING: failed to pull $image"; done
+
+      - name: Generate TLS certificates
+        run: ./generate-certs.sh ./certs
+
+      - name: Run interop tests
+        continue-on-error: true  # exits 1 when any test fails; publish results regardless
+        run: make interop-relay RELAY=wired
+
+      - name: Generate report
+        run: ./generate-report.sh
+
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: npx --yes vercel deploy --prod --yes --token="$VERCEL_TOKEN" results
