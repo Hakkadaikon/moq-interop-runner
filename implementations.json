@@ -588,9 +588,11 @@
       "organization": "Hakkadaikon",
       "repository": "https://github.com/Hakkadaikon/wired",
       "draft_versions": [
-        "draft-19"
+        "draft-22",
+        "draft-19",
+        "draft-18"
       ],
-      "notes": "libc-free C QUIC/WebTransport/MoQT stack. WebTransport only.",
+      "notes": "libc-free C QUIC/WebTransport/MoQT stack. WebTransport only. Negotiates whichever of draft-18/19/22 the peer offers (WT subprotocol moqt-18/moqt-19/moqt-22).",
       "roles": {
         "relay": {
           "docker": {
