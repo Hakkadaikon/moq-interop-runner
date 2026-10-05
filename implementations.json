@@ -592,12 +592,37 @@
         "draft-19",
         "draft-18"
       ],
-      "notes": "libc-free C QUIC/WebTransport/MoQT stack. WebTransport only. Negotiates whichever of draft-18/19/22 the peer offers (WT subprotocol moqt-18/moqt-19/moqt-22).",
+      "notes": "libc-free C QUIC/WebTransport/MoQT stack. One UDP port serves both WebTransport (ALPN h3, WT subprotocol moqt-18/moqt-19/moqt-22) and raw QUIC (ALPN moqt-22/moqt-19/moqt-18); this is the WebTransport entry, see wired-quic for raw QUIC. Negotiates whichever of draft-18/19/22 the peer offers.",
       "roles": {
         "relay": {
           "docker": {
             "image": "ghcr.io/hakkadaikon/wired-moqt-interop:latest",
             "url": "https://relay:4443"
+          }
+        }
+      }
+    },
+    "wired-quic": {
+      "name": "wired (relay, raw QUIC)",
+      "organization": "Hakkadaikon",
+      "repository": "https://github.com/Hakkadaikon/wired",
+      "draft_versions": [
+        "draft-22",
+        "draft-19",
+        "draft-18"
+      ],
+      "notes": "Same wired binary as `wired`; one UDP port serves both h3 (WebTransport) and ALPN moqt-22/moqt-19/moqt-18 (raw QUIC). Registered separately so docker mode exercises the moqt:// transport.",
+      "roles": {
+        "relay": {
+          "docker": {
+            "image": "wired-interop-relay-quic:latest",
+            "url": "moqt://relay:4443",
+            "build": {
+              "dockerfile": "adapters/wired/Dockerfile.relay.quic",
+              "context": "adapters/wired"
+            },
+            "upstream_image": "ghcr.io/hakkadaikon/wired-moqt-interop:latest",
+            "notes": "Re-tag of the wired relay image (identical binary, both transports on one port); the separate image exists only because docker mode resolves the relay URL by image name."
           }
         }
       }

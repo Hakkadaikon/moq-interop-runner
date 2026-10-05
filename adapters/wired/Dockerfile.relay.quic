@@ -1,0 +1,22 @@
+# wired adapter for MoQT interop testing (relay role, raw QUIC)
+#
+# A plain re-tag of the wired relay image. The wired binary already serves
+# both transports on one UDP port: ALPN h3 (WebTransport, the `wired`
+# entry's https:// URL) and ALPN moqt-22/moqt-19/moqt-18 (raw QUIC, this
+# entry's moqt:// URL). This separate image exists only because docker mode
+# resolves a relay's URL by its image name (Makefile RESOLVE_RELAY_URL), so
+# one image cannot be registered with two URLs.
+#
+# Build:
+#   docker build -t wired-interop-relay-quic:latest \
+#     -f adapters/wired/Dockerfile.relay.quic adapters/wired/
+#
+# Usage:
+#   docker run -v ./certs:/certs -p 4443:4443/udp wired-interop-relay-quic:latest
+FROM ghcr.io/hakkadaikon/wired-moqt-interop:latest
+
+# The upstream entrypoint (run_endpoint.sh) reads MOQT_PORT (default 4443)
+# and MOQT_TRANSPORT (default `both`: h3 and raw QUIC on the same port).
+ENV MOQT_PORT=4443
+
+EXPOSE 4443/udp
