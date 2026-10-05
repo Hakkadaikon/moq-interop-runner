@@ -23,9 +23,23 @@ jobs:
       - name: Generate TLS certificates
         run: ./generate-certs.sh ./certs
 
-      - name: Run interop tests
+      - name: Run interop tests (WebTransport relay)
         continue-on-error: true  # exits 1 when any test fails; publish results regardless
         run: make interop-relay RELAY=wired
+
+      - name: Build raw-QUIC relay adapter
+        run: docker build -t wired-interop-relay-quic:latest -f adapters/wired/Dockerfile.relay.quic adapters/wired
+
+      - name: Run interop tests (raw QUIC relay, moqt://)
+        continue-on-error: true
+        run: make interop-relay RELAY=wired-quic
+
+      - name: Upload all results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results
+          path: results/
 
       - name: Generate report
         run: ./generate-report.sh
