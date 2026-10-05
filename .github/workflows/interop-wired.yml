@@ -41,6 +41,22 @@ jobs:
           name: interop-results
           path: results/
 
+      # Each make interop-relay run writes its own results/<timestamp>/ and
+      # generate-report.sh shows only the newest one. Fold the two runs into
+      # one directory (summary.json rows carry the relay name) so a single
+      # report shows wired and wired-quic side by side.
+      - name: Merge wired and wired-quic results
+        run: |
+          set -euo pipefail
+          dirs=$(ls -1d results/*/ | sort | tail -n 2)
+          first=$(echo "$dirs" | head -n 1); second=$(echo "$dirs" | tail -n 1)
+          [ "$first" != "$second" ] || exit 0
+          cp -n "$second"/*.log "$first" 2>/dev/null || true
+          jq -s '.[0].runs += .[1].runs | .[0]' \
+            "$first/summary.json" "$second/summary.json" > merged.json
+          mv merged.json "$first/summary.json"
+          rm -rf "$second"
+
       - name: Generate report
         run: ./generate-report.sh
 
